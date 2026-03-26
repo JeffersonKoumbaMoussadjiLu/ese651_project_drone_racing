@@ -1,0 +1,1166 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   scripts/rsl_rl/train_race.py
+	modified:   src/isaac_quad_sim2real/tasks/race/config/crazyflie/agents/rsl_rl_ppo_cfg.py
+	modified:   src/isaac_quad_sim2real/tasks/race/config/crazyflie/quadcopter_env.py
+	modified:   src/isaac_quad_sim2real/tasks/race/config/crazyflie/quadcopter_strategies.py
+	modified:   src/third_parties/rsl_rl_local/rsl_rl/algorithms/ppo.py
+	modified:   src/third_parties/rsl_rl_local/rsl_rl/runners/on_policy_runner.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/scripts/rsl_rl/train_race.py b/scripts/rsl_rl/train_race.py
+index f420fc9..290e8bd 100644
+--- a/scripts/rsl_rl/train_race.py
++++ b/scripts/rsl_rl/train_race.py
+@@ -3,13 +3,26 @@
+ #
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
+-"""Script to train RL agent with RSL-RL."""
++"""Script to train RL agent with RSL-RL.
++
++This version is tuned for **speed-from-scratch** training:
++  - Reward keys match the new racing curriculum in quadcopter_strategies.py
++  - Episodes terminate on lap completion during training (quadcopter_env.py)
++
++Usage example (recommended):
++  ./isaaclab.sh -p scripts/rsl_rl/train_race.py --task Isaac-Quadcopter-Race-Direct-v0 \
++      --num_envs 8192 --max_iterations 5000 --logger wandb
++"""
+ 
+ """Launch Isaac Sim Simulator first."""
+ 
+ import sys
+ import os
+ 
++
++# -----------------------------------------------------------------------------
++# Prefer the provided local RSL-RL (so our PPO implementation is used).
++# -----------------------------------------------------------------------------
+ local_rsl_path = os.path.abspath("src/third_parties/rsl_rl_local")
+ if os.path.exists(local_rsl_path):
+     sys.path.insert(0, local_rsl_path)
+@@ -17,11 +30,15 @@ if os.path.exists(local_rsl_path):
+ else:
+     print(f"[WARNING] Local rsl_rl not found at: {local_rsl_path}")
+ 
+-from rsl_rl.utils import wandb_fix
++
++# Patch for wandb/pydantic namespace-package issue in Isaac Sim
++from rsl_rl.utils import wandb_fix  # noqa: F401
++
+ import argparse
+ from isaaclab.app import AppLauncher
+ import cli_args
+ 
++
+ # add argparse arguments
+ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
+ parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
+@@ -72,7 +89,8 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
+ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+ 
+ # Import extensions to set up environment tasks
+-import src.isaac_quad_sim2real.tasks   # noqa: F401
++import src.isaac_quad_sim2real.tasks  # noqa: F401
++
+ 
+ torch.backends.cuda.matmul.allow_tf32 = True
+ torch.backends.cudnn.allow_tf32 = True
+@@ -83,6 +101,7 @@ torch.backends.cudnn.benchmark = False
+ @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
+     """Train with RSL-RL agent."""
++
+     # override configurations with non-hydra CLI arguments
+     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+@@ -99,24 +118,51 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
+     log_root_path = os.path.abspath(log_root_path)
+     print(f"[INFO] Logging experiment in directory: {log_root_path}")
++
+     # specify directory for logging runs: {time-stamp}_{run_name}
+     log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+     if agent_cfg.run_name:
+         log_dir += f"_{agent_cfg.run_name}"
+     log_dir = os.path.join(log_root_path, log_dir)
+ 
+-    # TODO ----- START ----- Define rewards scales
+-    # reward scales
+-    progress_goal_reward_scale = 50.0
+-    crash_reward = -1.0
+-    death_cost = -10.0
++    # ------------------------------------------------------------------
++    # Rewards (tune here)
++    #
++    # Key points:
++    #  - Episodes terminate on lap completion during training.
++    #  - Speed is encouraged via velocity-to-gate shaping + time penalty.
++    #  - A finish bonus is larger when finishing earlier.
++    #  - A curriculum inside quadcopter_strategies.py ramps aggressiveness.
++    # ------------------------------------------------------------------
+ 
+     rewards = {
+-        'progress_goal_reward_scale': progress_goal_reward_scale,
+-        'crash_reward_scale': crash_reward,
+-        'death_cost': death_cost,
++        # Dense potential-based shaping (distance-to-current-gate)
++        "progress_reward_scale": 25.0,
++
++        # Sparse events
++        "gate_pass_reward_scale": 80.0,
++        "gate_miss_reward_scale": -200.0,
++
++        # Gate quality bonus (paid on the *gate pass step* only)
++        "center_at_pass_reward_scale": 15.0,
++
++        # Speed shaping (project velocity toward current/next gate)
++        "vel_to_gate_reward_scale": 12.0,
++        "vel_to_next_gate_reward_scale": 6.0,
++
++        # Finish bonus (paid once when lap target is reached)
++        "finish_reward_scale": 600.0,
++
++        # Regularization
++        # NOTE: time_penalty is scaled up by the strategy curriculum in race mode.
++        "time_penalty_reward_scale": -0.03,
++        "action_l2_reward_scale": -0.003,
++        "crash_reward_scale": -4.0,
++
++        # Terminal penalty on failure terminations (NOT applied on success finish)
++        # NOTE: scaled up by the strategy curriculum in race mode.
++        "death_cost": -120.0,
+     }
+-    # TODO ----- END -----
+ 
+     env_cfg.is_train = True
+     env_cfg.rewards = rewards
+@@ -149,12 +195,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+ 
+     # create runner from rsl-rl
+     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
++
+     # write git state to logs
+     runner.add_git_repo_to_log(__file__)
++
+     # load the checkpoint
+     if agent_cfg.resume:
+         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+-        # load previously trained model
+         runner.load(resume_path)
+ 
+     # dump the configuration into log-directory
+@@ -164,14 +211,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
+ 
+     # run training
+-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
++    # IMPORTANT: disable init_at_random_ep_len for time-to-finish optimization.
++    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
+ 
+     # close the simulator
+     env.close()
+ 
+ 
+ if __name__ == "__main__":
+-    # run the main function
+     main()
+-    # close sim app
+     simulation_app.close()
+diff --git a/src/isaac_quad_sim2real/tasks/race/config/crazyflie/agents/rsl_rl_ppo_cfg.py b/src/isaac_quad_sim2real/tasks/race/config/crazyflie/agents/rsl_rl_ppo_cfg.py
+index 088ed47..97071bd 100644
+--- a/src/isaac_quad_sim2real/tasks/race/config/crazyflie/agents/rsl_rl_ppo_cfg.py
++++ b/src/isaac_quad_sim2real/tasks/race/config/crazyflie/agents/rsl_rl_ppo_cfg.py
+@@ -10,27 +10,36 @@ from .rl_cfg import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgo
+ 
+ @configclass
+ class QuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+-    num_steps_per_env = 24
+-    max_iterations = 200
+-    save_interval = 50
+-    experiment_name = "quadcopter_direct"
+-    empirical_normalization = False
+-    wandb_project = "ese651_quadcopter"  # Wandb project name for logging
++    # Longer rollouts improve credit assignment for racing lines.
++    num_steps_per_env = 32
++
++    # Competitive policies typically need thousands of iterations.
++    max_iterations = 5000
++    save_interval = 200
++
++    experiment_name = "quadcopter_race_v5_dr"
++    empirical_normalization = True
++
++    # WandB project name for logging (optional)
++    wandb_project = "ese651_quadcopter"
++
+     policy = RslRlPpoActorCriticCfg(
+         init_noise_std=1.0,
+-        actor_hidden_dims=[128, 128],
+-        critic_hidden_dims=[512, 256, 128, 128],
++        actor_hidden_dims=[256, 256, 128],
++        critic_hidden_dims=[256, 256, 128],
+         activation="elu",
+-        min_std=0.0,
++        # keep some exploration so it doesn't collapse too early
++        min_std=0.05,
+     )
++
+     algorithm = RslRlPpoAlgorithmCfg(
+         value_loss_coef=1.0,
+         use_clipped_value_loss=True,
+         clip_param=0.2,
+-        entropy_coef=0.0,
+-        num_learning_epochs=5,
+-        num_mini_batches=4,
+-        learning_rate=5.0e-4,
++        entropy_coef=0.01,
++        num_learning_epochs=6,
++        num_mini_batches=8,
++        learning_rate=3.0e-4,
+         schedule="adaptive",
+         gamma=0.99,
+         lam=0.95,
+diff --git a/src/isaac_quad_sim2real/tasks/race/config/crazyflie/quadcopter_env.py b/src/isaac_quad_sim2real/tasks/race/config/crazyflie/quadcopter_env.py
+index 7318b01..3216824 100644
+--- a/src/isaac_quad_sim2real/tasks/race/config/crazyflie/quadcopter_env.py
++++ b/src/isaac_quad_sim2real/tasks/race/config/crazyflie/quadcopter_env.py
+@@ -273,6 +273,9 @@ class QuadcopterEnv(DirectRLEnv):
+ 
+         self._crashed = torch.zeros(self.num_envs, device=self.device, dtype=torch.int)
+ 
++        # Success flag (used to avoid applying death_cost on successful finishes)
++        self._finished = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
++
+         # Motor dynamics
+         self.cfg.thrust_to_weight = 3.15
+         r = self.cfg.arm_length * np.sqrt(2.0) / 2.0
+@@ -678,16 +681,43 @@ class QuadcopterEnv(DirectRLEnv):
+         # will not be used during runtime for the official class race.
+         #TODO ----- END ----- [OPTIONAL]
+ 
++        # ------------------------------------------------------------------
++        # Finish condition (enabled in BOTH train and eval)
++        #
++        # IMPORTANT subtlety:
++        #   _n_gates_passed is incremented in quadcopter_strategies.get_rewards()
++        #   and _get_dones() is called before _get_rewards() in DirectRLEnv.
++        #   Therefore, this finish flag is effectively detected 1 sim-step after
++        #   the final gate pass. This is fine for training and evaluation.
++        #
++        # Lap curriculum (train only):
++        #   - First ~800 iters: 1 lap
++        #   - Next  ~800 iters: 2 laps
++        #   - Afterwards: cfg.max_n_laps
++        # This makes learning much faster from scratch, then ramps to full race.
++        # ------------------------------------------------------------------
++
++        num_gates = self._waypoints.shape[0]
++        laps_target = self.cfg.max_n_laps
++        if self.cfg.is_train:
++            it = int(getattr(self, "iteration", 0))
++            if it < 800:
++                laps_target = 1
++            elif it < 1600:
++                laps_target = min(2, self.cfg.max_n_laps)
++
++        cond_finished = ((self._n_gates_passed - 1) // num_gates >= laps_target)
++        self._finished = cond_finished
++
+         died = (
+             cond_max_h
+-          | cond_h_min_time
+-          | cond_crashed
++            | cond_h_min_time
++            | cond_crashed
++            | cond_finished
+         )
+ 
+-        # timeout conditions
++        # timeout conditions (pure time-limit truncation)
+         time_out = self.episode_length_buf >= self.max_episode_length - 1
+-        if not self.cfg.is_train:
+-            time_out = time_out | ((self._n_gates_passed - 1) // (self._waypoints.shape[0]) >= self.cfg.max_n_laps)
+ 
+         return died, time_out
+ 
+diff --git a/src/isaac_quad_sim2real/tasks/race/config/crazyflie/quadcopter_strategies.py b/src/isaac_quad_sim2real/tasks/race/config/crazyflie/quadcopter_strategies.py
+index d5f1ac5..916c00b 100644
+--- a/src/isaac_quad_sim2real/tasks/race/config/crazyflie/quadcopter_strategies.py
++++ b/src/isaac_quad_sim2real/tasks/race/config/crazyflie/quadcopter_strategies.py
+@@ -3,266 +3,493 @@
+ #
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
+-"""Modular strategy classes for quadcopter environment rewards, observations, and resets."""
++"""V5 strategy: v3 racing policy + domain randomization for sim2real robustness.
++
++This is v3 (proven working: speed curriculum, velocity shaping, finish bonus,
++lap curriculum, correct gate detection) with ONE addition: domain randomization
++of physics parameters matching the TA evaluation ranges.
++
++Design: resume from a trained v3 checkpoint, then fine-tune with DR.
++"""
+ 
+ from __future__ import annotations
+ 
+-import torch
++from typing import TYPE_CHECKING, Dict, Optional
++
+ import numpy as np
+-from typing import TYPE_CHECKING, Dict, Optional, Tuple
++import torch
+ 
+-from isaaclab.utils.math import subtract_frame_transforms, quat_from_euler_xyz, euler_xyz_from_quat, wrap_to_pi, matrix_from_quat
++from isaaclab.utils.math import subtract_frame_transforms, quat_from_euler_xyz
+ 
+ if TYPE_CHECKING:
+     from .quadcopter_env import QuadcopterEnv
+ 
++
+ D2R = np.pi / 180.0
+-R2D = 180.0 / np.pi
+ 
+ 
+ class DefaultQuadcopterStrategy:
+-    """Default strategy implementation for quadcopter environment."""
++    """Race-optimized strategy (reward, obs, reset) with domain randomization."""
+ 
+-    def __init__(self, env: QuadcopterEnv):
+-        """Initialize the default strategy.
++    # ------------------------------------------------------------------
++    # Domain randomization schedule
++    # ------------------------------------------------------------------
++    # DR ramps from 0% to 100% of TA ranges over these iterations.
++    # When resuming from v3, DR starts immediately but gently.
++    _DR_RAMP_START = 0      # iteration to begin DR
++    _DR_RAMP_END = 1500     # iteration at which DR reaches full TA ranges
+ 
+-        Args:
+-            env: The quadcopter environment instance.
+-        """
++    def __init__(self, env: QuadcopterEnv):
+         self.env = env
+         self.device = env.device
+         self.num_envs = env.num_envs
+         self.cfg = env.cfg
+ 
+-        # Initialize episode sums for logging if in training mode
+-        if self.cfg.is_train and hasattr(env, 'rew'):
+-            keys = [key.split("_reward_scale")[0] for key in env.rew.keys() if key != "death_cost"]
++        # Previous actions as part of obs (helps smooth control).
++        self._prev_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
++
++        # Episode logging
++        if self.cfg.is_train and hasattr(env, "rew"):
++            keys = [k.split("_reward_scale")[0] for k in env.rew.keys() if k != "death_cost"]
+             self._episode_sums = {
+-                key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+-                for key in keys
++                key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device) for key in keys
+             }
+ 
+-        # Initialize fixed parameters once (no domain randomization)
+-        # These parameters remain constant throughout the simulation
+-        # Aerodynamic drag coefficients
++        # ----------------------------------------------------------
++        # Set NOMINAL physics first (same as v3)
++        # These will be overwritten per-env in reset_idx when DR is active.
++        # ----------------------------------------------------------
++        self._set_nominal_physics()
++
++        # Gate geometry (square opening in gate frame y/z)
++        self._gate_half_side = float(self.cfg.gate_model.gate_side) / 2.0
++
++        # --------------------------
++        # Curriculums / constants (identical to v3)
++        # --------------------------
++        self._gate_margin_start = 0.05
++        self._gate_margin_end = 0.02
++
++        self._speed_phase_start_iter = 600
++        self._speed_phase_end_iter = 2400
++
++        self._lap_1_end_iter = 800
++        self._lap_2_end_iter = 1600
++
++        self._v_cap = 15.0
++
++    # ------------------------------------------------------------------
++    # Physics helpers
++    # ------------------------------------------------------------------
++    def _set_nominal_physics(self):
++        """Set all physics to nominal config values (no randomization)."""
+         self.env._K_aero[:, :2] = self.env._k_aero_xy_value
+         self.env._K_aero[:, 2] = self.env._k_aero_z_value
+ 
+-        # PID controller gains for angular rate control
+-        # Roll and pitch use the same gains
+         self.env._kp_omega[:, :2] = self.env._kp_omega_rp_value
+         self.env._ki_omega[:, :2] = self.env._ki_omega_rp_value
+         self.env._kd_omega[:, :2] = self.env._kd_omega_rp_value
+ 
+-        # Yaw has different gains
+         self.env._kp_omega[:, 2] = self.env._kp_omega_y_value
+         self.env._ki_omega[:, 2] = self.env._ki_omega_y_value
+         self.env._kd_omega[:, 2] = self.env._kd_omega_y_value
+ 
+-        # Motor time constants (same for all 4 motors)
+         self.env._tau_m[:] = self.env._tau_m_value
+-
+-        # Thrust to weight ratio
+         self.env._thrust_to_weight[:] = self.env._twr_value
+ 
++    def _get_dr_strength(self) -> float:
++        """Get current DR strength as a fraction in [0, 1]."""
++        it = int(getattr(self.env, "iteration", 0))
++        if self._DR_RAMP_END <= self._DR_RAMP_START:
++            return 1.0
++        return float(np.clip(
++            (it - self._DR_RAMP_START) / float(self._DR_RAMP_END - self._DR_RAMP_START),
++            0.0, 1.0
++        ))
++
++    def _randomize_physics(self, env_ids: torch.Tensor):
++        """Randomize physics parameters for given env_ids using TA evaluation ranges.
++
++        Ranges from the project handout:
++          TWR:           nominal * [0.95, 1.05]
++          k_aero_xy/z:   nominal * [0.5, 2.0]
++          kp_omega_rp:   nominal * [0.85, 1.15]
++          ki_omega_rp:   nominal * [0.85, 1.15]
++          kd_omega_rp:   nominal * [0.70, 1.30]
++          kp_omega_y:    nominal * [0.85, 1.15]
++          ki_omega_y:    nominal * [0.85, 1.15]
++          kd_omega_y:    nominal * [0.70, 1.30]
++
++        DR strength ramps from 0 to 1 over training iterations.
++        At strength s, we interpolate: param = nominal * lerp(1.0, random_scale, s)
++        """
++        s = self._get_dr_strength()
++        if s < 1e-6:
++            # No randomization yet -- keep nominal
++            return
++
++        n = len(env_ids)
++        device = self.device
++
++        def _rand_scale(low: float, high: float, size: int) -> torch.Tensor:
++            """Sample a random multiplier, interpolated toward nominal by (1-s)."""
++            raw = torch.empty(size, device=device).uniform_(low, high)
++            return 1.0 + s * (raw - 1.0)  # lerp(1.0, raw, s)
++
++        # TWR: +/- 5%
++        twr_scale = _rand_scale(0.95, 1.05, n)
++        self.env._thrust_to_weight[env_ids] = self.env._twr_value * twr_scale
++
++        # Aero drag: 0.5x to 2.0x
++        aero_xy_scale = _rand_scale(0.5, 2.0, n)
++        aero_z_scale = _rand_scale(0.5, 2.0, n)
++        self.env._K_aero[env_ids, 0] = self.env._k_aero_xy_value * aero_xy_scale
++        self.env._K_aero[env_ids, 1] = self.env._k_aero_xy_value * aero_xy_scale
++        self.env._K_aero[env_ids, 2] = self.env._k_aero_z_value * aero_z_scale
++
++        # PID gains -- roll/pitch: kp/ki +/-15%, kd +/-30%
++        kp_rp_scale = _rand_scale(0.85, 1.15, n)
++        ki_rp_scale = _rand_scale(0.85, 1.15, n)
++        kd_rp_scale = _rand_scale(0.70, 1.30, n)
++        self.env._kp_omega[env_ids, 0] = self.env._kp_omega_rp_value * kp_rp_scale
++        self.env._kp_omega[env_ids, 1] = self.env._kp_omega_rp_value * kp_rp_scale
++        self.env._ki_omega[env_ids, 0] = self.env._ki_omega_rp_value * ki_rp_scale
++        self.env._ki_omega[env_ids, 1] = self.env._ki_omega_rp_value * ki_rp_scale
++        self.env._kd_omega[env_ids, 0] = self.env._kd_omega_rp_value * kd_rp_scale
++        self.env._kd_omega[env_ids, 1] = self.env._kd_omega_rp_value * kd_rp_scale
++
++        # PID gains -- yaw: kp/ki +/-15%, kd +/-30%
++        kp_y_scale = _rand_scale(0.85, 1.15, n)
++        ki_y_scale = _rand_scale(0.85, 1.15, n)
++        kd_y_scale = _rand_scale(0.70, 1.30, n)
++        self.env._kp_omega[env_ids, 2] = self.env._kp_omega_y_value * kp_y_scale
++        self.env._ki_omega[env_ids, 2] = self.env._ki_omega_y_value * ki_y_scale
++        self.env._kd_omega[env_ids, 2] = self.env._kd_omega_y_value * kd_y_scale
++
++    # ---------------------------------------------------------------------
++    # Rewards (identical to v3)
++    # ---------------------------------------------------------------------
+     def get_rewards(self) -> torch.Tensor:
+-        """get_rewards() is called per timestep. This is where you define your reward structure and compute them
+-        according to the reward scales you tune in train_race.py. The following is an example reward structure that
+-        causes the drone to hover near the zeroth gate. It will not produce a racing policy, but simply serves as proof
+-        if your PPO implementation works. You should delete it or heavily modify it once you begin the racing task."""
+-
+-        # TODO ----- START ----- Define the tensors required for your custom reward structure
+-        # check to change waypoint
+-        dist_to_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
+-        gate_passed = dist_to_gate < 0.1
+-        ids_gate_passed = torch.where(gate_passed)[0]
+-        self.env._idx_wp[ids_gate_passed] = (self.env._idx_wp[ids_gate_passed] + 1) % self.env._waypoints.shape[0]
+-
+-        # set desired positions in the world frame
+-        self.env._desired_pos_w[ids_gate_passed, :2] = self.env._waypoints[self.env._idx_wp[ids_gate_passed], :2]
+-        self.env._desired_pos_w[ids_gate_passed, 2] = self.env._waypoints[self.env._idx_wp[ids_gate_passed], 2]
+-
+-        # calculate progress via distance to goal
+-        distance_to_goal = torch.linalg.norm(self.env._desired_pos_w - self.env._robot.data.root_link_pos_w, dim=1)
+-        distance_to_goal = torch.tanh(distance_to_goal/3.0)
+-        progress = 1 - distance_to_goal  # distance_to_goal is between 0 and 1 where 0 means the drone reached the goal
+-
+-        # compute crashed environments if contact detected for 100 timesteps
++        """Compute per-step rewards and update waypoint bookkeeping."""
++
++        # Curriculum scalars
++        it = int(getattr(self.env, "iteration", 0))
++        if self._speed_phase_end_iter <= self._speed_phase_start_iter:
++            speed_phase = 1.0
++        else:
++            speed_phase = float(
++                np.clip(
++                    (it - self._speed_phase_start_iter)
++                    / float(self._speed_phase_end_iter - self._speed_phase_start_iter),
++                    0.0,
++                    1.0,
++                )
++            )
++
++        center_mult = 1.0 - 0.8 * speed_phase
++        action_mult = 1.0 - 0.7 * speed_phase
++        vel_mult = speed_phase
++        time_mult = 1.0 + 5.0 * speed_phase
++        death_mult = 1.0 + 3.0 * speed_phase
++
++        margin = float(self._gate_margin_start + (self._gate_margin_end - self._gate_margin_start) * speed_phase)
++
++        laps_target = int(self.cfg.max_n_laps)
++        if self.cfg.is_train:
++            if it < self._lap_1_end_iter:
++                laps_target = 1
++            elif it < self._lap_2_end_iter:
++                laps_target = min(2, laps_target)
++
++        # Core geometry
++        pose_gate = self.env._pose_drone_wrt_gate
++        xg, yg, zg = pose_gate[:, 0], pose_gate[:, 1], pose_gate[:, 2]
++
++        dist = torch.linalg.norm(pose_gate, dim=1)
++        prev_dist = self.env._last_distance_to_goal
++        progress = torch.clamp(prev_dist - dist, -0.50, 0.50)
++
++        prev_xg = self.env._prev_x_drone_wrt_gate
++        crossed_plane = (prev_xg > 0.0) & (xg <= 0.0)
++
++        inside_opening = (yg.abs() <= (self._gate_half_side - margin)) & (zg.abs() <= (self._gate_half_side - margin))
++        gate_pass = crossed_plane & inside_opening
++        gate_miss = crossed_plane & (~inside_opening)
++
+         contact_forces = self.env._contact_sensor.data.net_forces_w
+-        crashed = (torch.norm(contact_forces, dim=-1) > 1e-8).squeeze(1).int()
+-        mask = (self.env.episode_length_buf > 100).int()
+-        self.env._crashed = self.env._crashed + crashed * mask
+-        # TODO ----- END -----
++        contact_mag = torch.linalg.norm(contact_forces, dim=-1).squeeze(1)
++        contact = contact_mag > 1e-6
++        contact_mask = self.env.episode_length_buf > 10
++        crashed = (contact & contact_mask).float()
++
++        self.env._crashed = self.env._crashed + (crashed > 0).int()
++
++        action_l2 = torch.sum(self.env._actions**2, dim=1)
++
++        # Speed shaping
++        drone_pos_w = self.env._robot.data.root_link_pos_w
++        drone_quat_w = self.env._robot.data.root_quat_w
++        drone_lin_vel_b = self.env._robot.data.root_com_lin_vel_b
++
++        idx = self.env._idx_wp
++        gate_pos_w = self.env._waypoints[idx, :3]
++        next_idx = (idx + 1) % self.env._waypoints.shape[0]
++        next_gate_pos_w = self.env._waypoints[next_idx, :3]
++
++        gate_pos_b, _ = subtract_frame_transforms(drone_pos_w, drone_quat_w, gate_pos_w)
++        next_gate_pos_b, _ = subtract_frame_transforms(drone_pos_w, drone_quat_w, next_gate_pos_w)
++
++        gate_dir_b = gate_pos_b / (torch.linalg.norm(gate_pos_b, dim=1, keepdim=True) + 1e-6)
++        next_gate_dir_b = next_gate_pos_b / (torch.linalg.norm(next_gate_pos_b, dim=1, keepdim=True) + 1e-6)
++
++        vel_proj_gate = torch.sum(drone_lin_vel_b * gate_dir_b, dim=1)
++        vel_proj_next = torch.sum(drone_lin_vel_b * next_gate_dir_b, dim=1)
++
++        plane_focus = torch.exp(-xg.abs() / 0.5)
++
++        dt = float(self.env.cfg.sim.dt * self.env.cfg.decimation)
++        vel_to_gate = torch.clamp(vel_proj_gate, 0.0, self._v_cap) * dt
++        vel_to_next_gate = plane_focus * torch.clamp(vel_proj_next, 0.0, self._v_cap) * dt
++
++        center_err2 = yg**2 + zg**2
++        center_bonus = torch.exp(-center_err2 / (0.25**2))
++        center_at_pass = gate_pass.float() * center_bonus
++
++        # Finish detection
++        num_gates = self.env._waypoints.shape[0]
++        n_before = self.env._n_gates_passed
++        finish_before = ((n_before - 1) // num_gates >= laps_target)
++        n_after = n_before + gate_pass.int()
++        finish_after = ((n_after - 1) // num_gates >= laps_target)
++        finished_this_step = finish_after & (~finish_before)
++
++        max_steps = float(self.env.max_episode_length)
++        finish_time_frac = torch.clamp(self.env.episode_length_buf.float() / max_steps, 0.0, 1.0)
++        finish_bonus_scale = (1.0 - finish_time_frac) ** 2
++
++        # Waypoint bookkeeping
++        if gate_pass.any():
++            ids = torch.where(gate_pass)[0]
++            self.env._n_gates_passed[ids] += 1
++            new_idx = (self.env._idx_wp[ids] + 1) % self.env._waypoints.shape[0]
++            self.env._idx_wp[ids] = new_idx
++            self.env._desired_pos_w[ids] = self.env._waypoints[new_idx, :3]
++
++            new_pose_gate, _ = subtract_frame_transforms(
++                self.env._waypoints[new_idx, :3],
++                self.env._waypoints_quat[new_idx, :],
++                self.env._robot.data.root_link_state_w[ids, :3],
++            )
++            self.env._prev_x_drone_wrt_gate[ids] = new_pose_gate[:, 0]
++            self.env._last_distance_to_goal[ids] = torch.linalg.norm(new_pose_gate, dim=1)
++            self.env._pose_drone_wrt_gate[ids] = new_pose_gate
++
++        if self.cfg.is_train and gate_miss.any():
++            miss_ids = torch.where(gate_miss)[0]
++            self.env._crashed[miss_ids] = 1000
+ 
++        not_pass = ~gate_pass
++        self.env._prev_x_drone_wrt_gate[not_pass] = xg[not_pass]
++        self.env._last_distance_to_goal[not_pass] = dist[not_pass]
++
++        # Reward composition
+         if self.cfg.is_train:
+-            # TODO ----- START ----- Compute per-timestep rewards by multiplying with your reward scales (in train_race.py)
++            rew_cfg = self.env.rew
++
+             rewards = {
+-                "progress_goal": progress * self.env.rew['progress_goal_reward_scale'],
+-                "crash": crashed * self.env.rew['crash_reward_scale'],
++                "progress": progress * rew_cfg["progress_reward_scale"],
++                "gate_pass": gate_pass.float() * rew_cfg["gate_pass_reward_scale"],
++                "gate_miss": gate_miss.float() * rew_cfg["gate_miss_reward_scale"],
++                "center_at_pass": center_at_pass * (rew_cfg["center_at_pass_reward_scale"] * center_mult),
++                "vel_to_gate": vel_to_gate * (rew_cfg["vel_to_gate_reward_scale"] * vel_mult),
++                "vel_to_next_gate": vel_to_next_gate * (rew_cfg["vel_to_next_gate_reward_scale"] * vel_mult),
++                "finish": finished_this_step.float() * rew_cfg["finish_reward_scale"] * finish_bonus_scale,
++                "time_penalty": torch.ones_like(dist) * (rew_cfg["time_penalty_reward_scale"] * time_mult),
++                "action_l2": action_l2 * (rew_cfg["action_l2_reward_scale"] * action_mult),
++                "crash": crashed * rew_cfg["crash_reward_scale"],
+             }
++
+             reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
+-            reward = torch.where(self.env.reset_terminated,
+-                                torch.ones_like(reward) * self.env.rew['death_cost'], reward)
+ 
+-            # Logging
++            death_cost = rew_cfg["death_cost"] * death_mult
++            failure_term = self.env.reset_terminated & (~self.env._finished)
++            reward = torch.where(failure_term, torch.ones_like(reward) * death_cost, reward)
++
+             for key, value in rewards.items():
+                 self._episode_sums[key] += value
+-        else:   # This else condition implies eval is called with play_race.py. Can be useful to debug at test-time
++        else:
+             reward = torch.zeros(self.num_envs, device=self.device)
+-            # TODO ----- END -----
+ 
+         return reward
+ 
++    # ---------------------------------------------------------------------
++    # Observations (identical to v3)
++    # ---------------------------------------------------------------------
+     def get_observations(self) -> Dict[str, torch.Tensor]:
+-        """Get observations. Read reset_idx() and quadcopter_env.py to see which drone info is extracted from the sim.
+-        The following code is an example. You should delete it or heavily modify it once you begin the racing task."""
+-
+-        # TODO ----- START ----- Define tensors for your observation space. Be careful with frame transformations
+-        #### Basic drone states, modify for your needs)
+-        drone_pose_w = self.env._robot.data.root_link_pos_w
+-        drone_lin_vel_b = self.env._robot.data.root_com_lin_vel_b
++        drone_pos_w = self.env._robot.data.root_link_pos_w
+         drone_quat_w = self.env._robot.data.root_quat_w
++        drone_lin_vel_b = self.env._robot.data.root_com_lin_vel_b
++        drone_ang_vel_b = self.env._robot.data.root_ang_vel_b
+ 
+-        ##### Some example observations you may want to explore using
+-        # Angular velocities (referred to as body rates)
+-        # drone_ang_vel_b = self.env._robot.data.root_ang_vel_b  # [roll_rate, pitch_rate, yaw_rate]
+-
+-        # Current target gate information
+-        # current_gate_idx = self.env._idx_wp
+-        # current_gate_pos_w = self.env._waypoints[current_gate_idx, :3]  # World position of current gate
+-        # current_gate_yaw = self.env._waypoints[current_gate_idx, -1]    # Yaw orientation of current gate
+-
+-        # Relative position to current gate in gate frame
+-        drone_pos_gate_frame = self.env._pose_drone_wrt_gate
+-
+-        # Relative position to current gate in body frame
+-        # gate_pos_b, _ = subtract_frame_transforms(
+-        #     self.env._robot.data.root_link_pos_w,
+-        #     self.env._robot.data.root_quat_w,
+-        #     current_gate_pos_w
+-        # )
+-
+-        # Previous actions
+-        # prev_actions = self.env._previous_actions  # Shape: (num_envs, 4)
++        idx = self.env._idx_wp
++        gate_pos_w = self.env._waypoints[idx, :3]
++        next_idx = (idx + 1) % self.env._waypoints.shape[0]
++        next_gate_pos_w = self.env._waypoints[next_idx, :3]
+ 
+-        # Number of gates passed
+-        # gates_passed = self.env._n_gates_passed.unsqueeze(1).float()
++        gate_pos_b, _ = subtract_frame_transforms(drone_pos_w, drone_quat_w, gate_pos_w)
++        next_gate_pos_b, _ = subtract_frame_transforms(drone_pos_w, drone_quat_w, next_gate_pos_w)
+ 
+-        # TODO ----- END -----
++        drone_pos_gate = self.env._pose_drone_wrt_gate
++        gates_passed = self.env._n_gates_passed.unsqueeze(1).float()
+ 
+         obs = torch.cat(
+-            # TODO ----- START ----- List your observation tensors here to be concatenated together
+             [
+-                drone_pose_w,       # position in the world frame (3 dims)
+-                drone_lin_vel_b,    # velocity in the body frame (3 dims)
+-                drone_quat_w,       # quaternion in the world frame (4 dims)
+-                drone_pos_gate_frame
++                gate_pos_b,          # 3
++                next_gate_pos_b,     # 3
++                drone_pos_gate,      # 3
++                drone_lin_vel_b,     # 3
++                drone_ang_vel_b,     # 3
++                drone_quat_w,        # 4
++                self._prev_actions,  # 4
++                gates_passed,        # 1
+             ],
+-            # TODO ----- END -----
+             dim=-1,
+-        )
+-        observations = {"policy": obs}
++        )  # Total: 24
+ 
+-        return observations
++        self._prev_actions = self.env._actions.detach().clone()
++        return {"policy": obs}
+ 
++    # ---------------------------------------------------------------------
++    # Reset (v3 base + domain randomization)
++    # ---------------------------------------------------------------------
+     def reset_idx(self, env_ids: Optional[torch.Tensor]):
+-        """Reset specific environments to initial states."""
+         if env_ids is None or len(env_ids) == self.num_envs:
+             env_ids = self.env._robot._ALL_INDICES
+ 
+-        # Logging for training mode
+-        if self.cfg.is_train and hasattr(self, '_episode_sums'):
+-            extras = dict()
++        # Training logging
++        if self.cfg.is_train and hasattr(self, "_episode_sums"):
++            extras = {}
+             for key in self._episode_sums.keys():
+                 episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+                 extras["Episode_Reward/" + key] = episodic_sum_avg / self.env.max_episode_length_s
+                 self._episode_sums[key][env_ids] = 0.0
+-            self.env.extras["log"] = dict()
++            self.env.extras["log"] = dict(self.env.extras.get("log", {}))
+             self.env.extras["log"].update(extras)
+-            extras = dict()
++
++            extras = {}
+             extras["Episode_Termination/died"] = torch.count_nonzero(self.env.reset_terminated[env_ids]).item()
+             extras["Episode_Termination/time_out"] = torch.count_nonzero(self.env.reset_time_outs[env_ids]).item()
++            extras["Episode_Termination/finished"] = torch.count_nonzero(self.env._finished[env_ids]).item()
++
++            finished_mask = self.env._finished[env_ids]
++            if torch.any(finished_mask):
++                dt_step = float(self.env.cfg.sim.dt * self.env.cfg.decimation)
++                mean_finish_time = (self.env.episode_length_buf[env_ids][finished_mask].float() * dt_step).mean()
++                extras["Episode_Finish/finish_time_s"] = float(mean_finish_time.item())
++            else:
++                extras["Episode_Finish/finish_time_s"] = 0.0
++
++            # Log DR strength for monitoring
++            extras["Curriculum/dr_strength"] = self._get_dr_strength()
+             self.env.extras["log"].update(extras)
+ 
+-        # Call robot reset first
++        # Reset robot
+         self.env._robot.reset(env_ids)
+ 
+-        # Initialize model paths if needed
++        # Initialize model paths once
+         if not self.env._models_paths_initialized:
+             num_models_per_env = self.env._waypoints.size(0)
+-            model_prim_names_in_env = [f"{self.env.target_models_prim_base_name}_{i}" for i in range(num_models_per_env)]
++            model_prim_names_in_env = [
++                f"{self.env.target_models_prim_base_name}_{i}" for i in range(num_models_per_env)
++            ]
+ 
+             self.env._all_target_models_paths = []
+             for env_path in self.env.scene.env_prim_paths:
+                 paths_for_this_env = [f"{env_path}/{name}" for name in model_prim_names_in_env]
+                 self.env._all_target_models_paths.append(paths_for_this_env)
+-
+             self.env._models_paths_initialized = True
+ 
+         n_reset = len(env_ids)
+         if n_reset == self.num_envs and self.num_envs > 1:
+-            self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf,
+-                                                             high=int(self.env.max_episode_length))
++            self.env.episode_length_buf = torch.randint_like(
++                self.env.episode_length_buf, high=int(self.env.max_episode_length)
++            )
+ 
+-        # Reset action buffers
++        # Reset buffers
+         self.env._actions[env_ids] = 0.0
+         self.env._previous_actions[env_ids] = 0.0
++        self._prev_actions[env_ids] = 0.0
+         self.env._previous_yaw[env_ids] = 0.0
+         self.env._motor_speeds[env_ids] = 0.0
+         self.env._previous_omega_meas[env_ids] = 0.0
+         self.env._previous_omega_err[env_ids] = 0.0
+         self.env._omega_err_integral[env_ids] = 0.0
+ 
+-        # Reset joints state
++        # Reset joints
+         joint_pos = self.env._robot.data.default_joint_pos[env_ids]
+         joint_vel = self.env._robot.data.default_joint_vel[env_ids]
+         self.env._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+ 
+-        default_root_state = self.env._robot.data.default_root_state[env_ids]
+-
+-        # TODO ----- START ----- Define the initial state during training after resetting an environment.
+-        # This example code initializes the drone 2m behind the first gate. You should delete it or heavily
+-        # modify it once you begin the racing task.
+-
+-        # start from the zeroth waypoint (beginning of the race)
+-        waypoint_indices = torch.zeros(n_reset, device=self.device, dtype=self.env._idx_wp.dtype)
+-
+-        # get starting poses behind waypoints
+-        x0_wp = self.env._waypoints[waypoint_indices][:, 0]
+-        y0_wp = self.env._waypoints[waypoint_indices][:, 1]
+-        theta = self.env._waypoints[waypoint_indices][:, -1]
+-        z_wp = self.env._waypoints[waypoint_indices][:, 2]
+-
+-        x_local = -2.0 * torch.ones(n_reset, device=self.device)
+-        y_local = torch.zeros(n_reset, device=self.device)
+-        z_local = torch.zeros(n_reset, device=self.device)
+-
+-        # rotate local pos to global frame
+-        cos_theta = torch.cos(theta)
+-        sin_theta = torch.sin(theta)
+-        x_rot = cos_theta * x_local - sin_theta * y_local
+-        y_rot = sin_theta * x_local + cos_theta * y_local
+-        initial_x = x0_wp - x_rot
+-        initial_y = y0_wp - y_rot
+-        initial_z = z_local + z_wp
+-
+-        default_root_state[:, 0] = initial_x
+-        default_root_state[:, 1] = initial_y
+-        default_root_state[:, 2] = initial_z
+-
+-        # point drone towards the zeroth gate
+-        initial_yaw = torch.atan2(y0_wp - initial_y, x0_wp - initial_x)
+-        quat = quat_from_euler_xyz(
+-            torch.zeros(1, device=self.device),
+-            torch.zeros(1, device=self.device),
+-            initial_yaw + torch.empty(1, device=self.device).uniform_(-0.15, 0.15)
+-        )
+-        default_root_state[:, 3:7] = quat
+-        # TODO ----- END -----
++        default_root_state = self.env._robot.data.default_root_state[env_ids].clone()
++        default_root_state[:, 7:] = 0.0
+ 
+-        # Handle play mode initial position
+-        if not self.cfg.is_train:
+-            # x_local and y_local are randomly sampled
++        # ------------------- Training reset -------------------
++        if self.cfg.is_train:
++            waypoint_indices = torch.zeros(n_reset, device=self.device, dtype=self.env._idx_wp.dtype)
++            if getattr(self.env, "iteration", 0) >= 500:
++                p_rand = 0.20
++                rand_mask = torch.rand(n_reset, device=self.device) < p_rand
++                if rand_mask.any():
++                    waypoint_indices[rand_mask] = torch.randint(
++                        low=0,
++                        high=self.env._waypoints.shape[0],
++                        size=(int(rand_mask.sum().item()),),
++                        device=self.device,
++                        dtype=self.env._idx_wp.dtype,
++                    )
++
++            x0_wp = self.env._waypoints[waypoint_indices][:, 0]
++            y0_wp = self.env._waypoints[waypoint_indices][:, 1]
++            z_wp = self.env._waypoints[waypoint_indices][:, 2]
++            theta = self.env._waypoints[waypoint_indices][:, -1]
++
++            # Start-position curriculum (identical to v3)
++            it = int(getattr(self.env, "iteration", 0))
++            phase = float(np.clip(it / 800.0, 0.0, 1.0))
++            x_min = -2.0 - 1.0 * phase   # -2.0 -> -3.0
++            y_lim = 0.5 + 0.5 * phase     # 0.5  -> 1.0
++
++            x_local = torch.empty(n_reset, device=self.device).uniform_(x_min, -0.5)
++            y_local = torch.empty(n_reset, device=self.device).uniform_(-y_lim, y_lim)
++
++            cos_t = torch.cos(theta)
++            sin_t = torch.sin(theta)
++            x_rot = cos_t * x_local - sin_t * y_local
++            y_rot = sin_t * x_local + cos_t * y_local
++            initial_x = x0_wp - x_rot
++            initial_y = y0_wp - y_rot
++
++            z0 = torch.where(
++                waypoint_indices == 0,
++                torch.full((n_reset,), 0.05, device=self.device),
++                z_wp,
++            )
++
++            default_root_state[:, 0] = initial_x
++            default_root_state[:, 1] = initial_y
++            default_root_state[:, 2] = z0
++
++            yaw = torch.atan2(y0_wp - initial_y, x0_wp - initial_x)
++            yaw = yaw + torch.empty(n_reset, device=self.device).uniform_(-0.20, 0.20)
++            quat = quat_from_euler_xyz(
++                torch.zeros(n_reset, device=self.device),
++                torch.zeros(n_reset, device=self.device),
++                yaw,
++            )
++            default_root_state[:, 3:7] = quat
++
++        # ------------------- Play/eval reset -------------------
++        else:
+             x_local = torch.empty(1, device=self.device).uniform_(-3.0, -0.5)
+             y_local = torch.empty(1, device=self.device).uniform_(-1.0, 1.0)
+ 
+@@ -270,7 +497,6 @@ class DefaultQuadcopterStrategy:
+             y0_wp = self.env._waypoints[self.env._initial_wp, 1]
+             theta = self.env._waypoints[self.env._initial_wp, -1]
+ 
+-            # rotate local pos to global frame
+             cos_theta, sin_theta = torch.cos(theta), torch.sin(theta)
+             x_rot = cos_theta * x_local - sin_theta * y_local
+             y_rot = sin_theta * x_local + cos_theta * y_local
+@@ -278,46 +504,43 @@ class DefaultQuadcopterStrategy:
+             y0 = y0_wp - y_rot
+             z0 = 0.05
+ 
+-            # point drone towards the zeroth gate
+             yaw0 = torch.atan2(y0_wp - y0, x0_wp - x0)
+-
+             default_root_state = self.env._robot.data.default_root_state[0].unsqueeze(0)
+             default_root_state[:, 0] = x0
+             default_root_state[:, 1] = y0
+             default_root_state[:, 2] = z0
+-
++            default_root_state[:, 7:] = 0.0
+             quat = quat_from_euler_xyz(
+                 torch.zeros(1, device=self.device),
+                 torch.zeros(1, device=self.device),
+-                yaw0
++                yaw0,
+             )
+             default_root_state[:, 3:7] = quat
+             waypoint_indices = self.env._initial_wp
+ 
+-        # Set waypoint indices and desired positions
++        # Apply waypoint indices and state
+         self.env._idx_wp[env_ids] = waypoint_indices
+-
+-        self.env._desired_pos_w[env_ids, :2] = self.env._waypoints[waypoint_indices, :2].clone()
+-        self.env._desired_pos_w[env_ids, 2] = self.env._waypoints[waypoint_indices, 2].clone()
+-
+-        self.env._last_distance_to_goal[env_ids] = torch.linalg.norm(
+-            self.env._desired_pos_w[env_ids, :2] - self.env._robot.data.root_link_pos_w[env_ids, :2], dim=1
+-        )
++        self.env._desired_pos_w[env_ids] = self.env._waypoints[waypoint_indices, :3].clone()
+         self.env._n_gates_passed[env_ids] = 0
++        self.env._yaw_n_laps[env_ids] = 0
++        self.env._crashed[env_ids] = 0
++        self.env._finished[env_ids] = False
+ 
+-        # Write state to simulation
+         self.env._robot.write_root_link_pose_to_sim(default_root_state[:, :7], env_ids)
+         self.env._robot.write_root_com_velocity_to_sim(default_root_state[:, 7:], env_ids)
+ 
+-        # Reset variables
+-        self.env._yaw_n_laps[env_ids] = 0
+-
++        # Initialize pose buffers
+         self.env._pose_drone_wrt_gate[env_ids], _ = subtract_frame_transforms(
+             self.env._waypoints[self.env._idx_wp[env_ids], :3],
+             self.env._waypoints_quat[self.env._idx_wp[env_ids], :],
+-            self.env._robot.data.root_link_state_w[env_ids, :3]
++            self.env._robot.data.root_link_state_w[env_ids, :3],
+         )
++        self.env._prev_x_drone_wrt_gate[env_ids] = self.env._pose_drone_wrt_gate[env_ids, 0].clone()
++        self.env._last_distance_to_goal[env_ids] = torch.linalg.norm(self.env._pose_drone_wrt_gate[env_ids], dim=1)
+ 
+-        self.env._prev_x_drone_wrt_gate[env_ids] = 1.0
+-
+-        self.env._crashed[env_ids] = 0
+\ No newline at end of file
++        # ==============================================================
++        # DOMAIN RANDOMIZATION (the ONLY addition over v3)
++        # Randomize physics for reset envs. Ramps gradually.
++        # ==============================================================
++        if self.cfg.is_train:
++            self._randomize_physics(env_ids)
+diff --git a/src/third_parties/rsl_rl_local/rsl_rl/algorithms/ppo.py b/src/third_parties/rsl_rl_local/rsl_rl/algorithms/ppo.py
+index 5bb2484..0282c3a 100644
+--- a/src/third_parties/rsl_rl_local/rsl_rl/algorithms/ppo.py
++++ b/src/third_parties/rsl_rl_local/rsl_rl/algorithms/ppo.py
+@@ -125,6 +125,10 @@ class PPO:
+         mean_surrogate_loss = 0
+         mean_entropy = 0
+ 
++        # Adaptive learning-rate (optional)
++        if self.schedule == "adaptive":
++            lr = self.learning_rate
++
+         # generator for mini batches
+         if self.actor_critic.is_recurrent:
+             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+@@ -146,14 +150,110 @@ class PPO:
+             episode_masks,
+             _,  # rnd_state_batch - not used anymore
+         ) in generator:
+-            # TODO ----- START -----
+-            # Implement the PPO update step
+-            # TODO ----- END -----
++            # ------------------------------------------------------------
++            # (Optional) per-mini-batch advantage normalization
++            # ------------------------------------------------------------
++            if self.normalize_advantage_per_mini_batch:
++                advantage_estimates = (advantage_estimates - advantage_estimates.mean()) / (
++                    advantage_estimates.std() + 1.0e-8
++                )
++
++            # Ensure shapes
++            if prev_log_probs.dim() == 2 and prev_log_probs.shape[1] == 1:
++                old_log_prob = prev_log_probs.squeeze(1)
++            else:
++                old_log_prob = prev_log_probs
++
++            if discounted_returns.dim() == 2 and discounted_returns.shape[1] == 1:
++                returns = discounted_returns
++            else:
++                returns = discounted_returns.unsqueeze(1)
++
++            # ------------------------------------------------------------
++            # Forward pass
++            # ------------------------------------------------------------
++            if self.actor_critic.is_recurrent:
++                # hidden_states is (hid_a, hid_c)
++                self.actor_critic.act(observations, masks=episode_masks, hidden_states=hidden_states[0])
++                new_log_prob = self.actor_critic.get_actions_log_prob(sampled_actions)
++                value = self.actor_critic.evaluate(
++                    critic_observations, masks=episode_masks, hidden_states=hidden_states[1]
++                )
++            else:
++                self.actor_critic.act(observations)
++                new_log_prob = self.actor_critic.get_actions_log_prob(sampled_actions)
++                value = self.actor_critic.evaluate(critic_observations)
++
++            entropy = self.actor_critic.entropy
++
++            # ------------------------------------------------------------
++            # Policy loss (clipped surrogate)
++            # ------------------------------------------------------------
++            ratio = torch.exp(new_log_prob - old_log_prob)
++            adv = advantage_estimates.squeeze(-1)
++            surrogate_1 = ratio * adv
++            surrogate_2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv
++            surrogate_loss = -torch.min(surrogate_1, surrogate_2).mean()
++
++            # ------------------------------------------------------------
++            # Value loss (optionally clipped)
++            # value_targets are the OLD values at sample time.
++            # ------------------------------------------------------------
++            if self.use_clipped_value_loss:
++                value_clipped = value_targets + (value - value_targets).clamp(-self.clip_param, self.clip_param)
++                value_losses = (value - returns).pow(2)
++                value_losses_clipped = (value_clipped - returns).pow(2)
++                value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
++            else:
++                value_loss = 0.5 * (returns - value).pow(2).mean()
++
++            # ------------------------------------------------------------
++            # Total loss
++            # ------------------------------------------------------------
++            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
++
++            # ------------------------------------------------------------
++            # Adaptive LR via approximate KL
++            # ------------------------------------------------------------
++            if self.schedule == "adaptive":
++                with torch.no_grad():
++                    mu0 = prev_mean_actions
++                    std0 = prev_action_stds
++                    mu1 = self.actor_critic.action_mean
++                    std1 = self.actor_critic.action_std
++
++                    std0 = torch.clamp(std0, min=1e-6)
++                    std1 = torch.clamp(std1, min=1e-6)
++
++                    kl = torch.log(std1 / std0) + (std0.pow(2) + (mu0 - mu1).pow(2)) / (2.0 * std1.pow(2)) - 0.5
++                    kl_mean = kl.sum(-1).mean()
++
++                    if kl_mean > 2.0 * self.desired_kl:
++                        lr = max(lr / 1.5, 1e-5)
++                    elif kl_mean < 0.5 * self.desired_kl:
++                        lr = min(lr * 1.5, 1e-3)
++
++                    for pg in self.optimizer.param_groups:
++                        pg["lr"] = lr
++                self.learning_rate = lr
++
++            # ------------------------------------------------------------
++            # Backprop
++            # ------------------------------------------------------------
++            self.optimizer.zero_grad(set_to_none=True)
++            loss.backward()
++            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
++            self.optimizer.step()
++
++            mean_value_loss += value_loss.item()
++            mean_surrogate_loss += surrogate_loss.item()
++            mean_entropy += entropy.mean().item()
+ 
+         num_updates = self.num_learning_epochs * self.num_mini_batches
+         mean_value_loss /= num_updates
+         mean_surrogate_loss /= num_updates
+         mean_entropy /= num_updates
++
+         # Clear the storage
+         self.storage.clear()
+ 
+diff --git a/src/third_parties/rsl_rl_local/rsl_rl/runners/on_policy_runner.py b/src/third_parties/rsl_rl_local/rsl_rl/runners/on_policy_runner.py
+index f838877..314fc08 100644
+--- a/src/third_parties/rsl_rl_local/rsl_rl/runners/on_policy_runner.py
++++ b/src/third_parties/rsl_rl_local/rsl_rl/runners/on_policy_runner.py
+@@ -235,7 +235,8 @@ class OnPolicyRunner:
+                 # Log information
+                 self.log(locals())
+                 # Save model
+-                curr_reward = statistics.mean(rewbuffer)
++                #curr_reward = statistics.mean(rewbuffer)
++                curr_reward = statistics.mean(rewbuffer) if len(rewbuffer) > 0 else 0.0
+                 if it % self.save_interval == 0:
+                     self.save(os.path.join(self.log_dir, f"model_{it}_{int(curr_reward)}.pt"))
+                 if curr_reward > self.max_reward:

@@ -16,5 +16,5 @@
 
 # RL-Games
 **/runs/*
-**/logs/*
+#**/logs/*
 **/recordings/*
