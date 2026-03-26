@@ -125,6 +125,10 @@ class PPO:
         mean_surrogate_loss = 0
         mean_entropy = 0
 
+        # Adaptive learning-rate (optional)
+        if self.schedule == "adaptive":
+            lr = self.learning_rate
+
         # generator for mini batches
         if self.actor_critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -148,13 +152,104 @@ class PPO:
         ) in generator:
             # TODO ----- START -----
             # Implement the PPO update step
+
+            # Per-mini-batch advantage normalization
+            if self.normalize_advantage_per_mini_batch:
+                advantage_estimates = (advantage_estimates - advantage_estimates.mean()) / (
+                    advantage_estimates.std() + 1.0e-8
+                )
+
+            # Ensure shapes
+            if prev_log_probs.dim() == 2 and prev_log_probs.shape[1] == 1:
+                old_log_prob = prev_log_probs.squeeze(1)
+            else:
+                old_log_prob = prev_log_probs
+
+            if discounted_returns.dim() == 2 and discounted_returns.shape[1] == 1:
+                returns = discounted_returns
+            else:
+                returns = discounted_returns.unsqueeze(1)
+
+            # Forward pass
+            if self.actor_critic.is_recurrent:
+                # hidden_states is (hid_a, hid_c)
+                self.actor_critic.act(observations, masks=episode_masks, hidden_states=hidden_states[0])
+                new_log_prob = self.actor_critic.get_actions_log_prob(sampled_actions)
+                value = self.actor_critic.evaluate(
+                    critic_observations, masks=episode_masks, hidden_states=hidden_states[1]
+                )
+            else:
+                self.actor_critic.act(observations)
+                new_log_prob = self.actor_critic.get_actions_log_prob(sampled_actions)
+                value = self.actor_critic.evaluate(critic_observations)
+
+            entropy = self.actor_critic.entropy
+
+            # Policy loss (clipped surrogate)
+            ratio = torch.exp(new_log_prob - old_log_prob)
+            adv = advantage_estimates.squeeze(-1)
+            surrogate_1 = ratio * adv
+            surrogate_2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv
+            surrogate_loss = -torch.min(surrogate_1, surrogate_2).mean()
+
+            # Value loss which is optionally clipped
+            # value_targets are the OLD values at sample time
+
+            if self.use_clipped_value_loss:
+                value_clipped = value_targets + (value - value_targets).clamp(-self.clip_param, self.clip_param)
+                value_losses = (value - returns).pow(2)
+                value_losses_clipped = (value_clipped - returns).pow(2)
+                value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = 0.5 * (returns - value).pow(2).mean()
+
+            # Total loss
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+
+        
+            # Adaptive LR via approximate KL
+            if self.schedule == "adaptive":
+                with torch.no_grad():
+                    mu0 = prev_mean_actions
+                    std0 = prev_action_stds
+                    mu1 = self.actor_critic.action_mean
+                    std1 = self.actor_critic.action_std
+
+                    std0 = torch.clamp(std0, min=1e-6)
+                    std1 = torch.clamp(std1, min=1e-6)
+
+                    kl = torch.log(std1 / std0) + (std0.pow(2) + (mu0 - mu1).pow(2)) / (2.0 * std1.pow(2)) - 0.5
+                    kl_mean = kl.sum(-1).mean()
+
+                    if kl_mean > 2.0 * self.desired_kl:
+                        lr = max(lr / 1.5, 1e-5)
+                    elif kl_mean < 0.5 * self.desired_kl:
+                        lr = min(lr * 1.5, 1e-3)
+
+                    for pg in self.optimizer.param_groups:
+                        pg["lr"] = lr
+                self.learning_rate = lr
+
+    
+            # Backprop
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            mean_entropy += entropy.mean().item()
+
             # TODO ----- END -----
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+
         # Clear the storage
         self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss, mean_entropy
+

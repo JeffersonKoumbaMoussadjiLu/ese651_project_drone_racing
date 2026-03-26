@@ -107,14 +107,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # TODO ----- START ----- Define rewards scales
     # reward scales
-    progress_goal_reward_scale = 50.0
-    crash_reward = -1.0
-    death_cost = -10.0
+
+    # ------------------------------------------------------------------
+    # Rewards (tune here)
+    #
+    # Key points:
+    #  - Episodes terminate on lap completion during training
+    #  - Speed is encouraged via velocity to gate shaping and time penalty
+    #  - A finish bonus is larger when finishing earlier
+    #  - A curriculum inside quadcopter_strategies.py ramps aggressiveness
+    # ------------------------------------------------------------------
 
     rewards = {
-        'progress_goal_reward_scale': progress_goal_reward_scale,
-        'crash_reward_scale': crash_reward,
-        'death_cost': death_cost,
+        # Dense potential-based shaping (distance-to-current-gate)
+        "progress_reward_scale": 25.0,
+
+        # Sparse events
+        "gate_pass_reward_scale": 80.0,
+        "gate_miss_reward_scale": -200.0,
+
+        # Gate quality bonus (paid on the *gate pass step* only)
+        "center_at_pass_reward_scale": 15.0,
+
+        # Speed shaping (project velocity toward current/next gate)
+        "vel_to_gate_reward_scale": 12.0,
+        "vel_to_next_gate_reward_scale": 6.0,
+
+        # Finish bonus (paid once when lap target is reached)
+        "finish_reward_scale": 600.0,
+
+        # Regularization
+        # NOTE: time_penalty is scaled up by the strategy curriculum in race mode
+        "time_penalty_reward_scale": -0.03,
+        "action_l2_reward_scale": -0.003,
+        "crash_reward_scale": -4.0,
+
+        # Terminal penalty on failure terminations (NOT applied on success finish)
+        # NOTE: scaled up by the strategy curriculum in race mode.
+        "death_cost": -120.0,
     }
     # TODO ----- END -----
 
