@@ -1,4 +1,4 @@
 
 set PYTHONPATH=%CD%
 
-C:\Users\jeffe\OneDrive\Desktop\ESE6510\ese651_project_drone_racing>python scripts/rsl_rl/train_race.py --task Isaac-Quadcopter-Race-v0 --num_envs 4096 --max_iterations 5000 --headless --logger wandb
+python scripts/rsl_rl/train_race.py --task Isaac-Quadcopter-Race-v0 --num_envs 2048 --max_iterations 5000 --headless --logger wandb

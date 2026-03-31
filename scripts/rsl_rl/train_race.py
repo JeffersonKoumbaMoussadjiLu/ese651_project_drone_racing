@@ -124,33 +124,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     rewards = {
         # Dense potential-based shaping (distance-to-current-gate)
-        "progress_reward_scale": 25.0,
+        # Lower than before so the policy is less myopic about only the current gate.
+        "progress_reward_scale": 18.0,
 
-        # Sparse events
+        # Sparse legality / task events
         "gate_pass_reward_scale": 80.0,
-        "gate_miss_reward_scale": -200.0,
-        "wrong_way_reward_scale": -200.0,
-        "illegal_gate_reward_scale": -200.0,
+        "gate_miss_reward_scale": -250.0,
+        "wrong_way_reward_scale": -250.0,
+        "illegal_gate_reward_scale": -250.0,
 
-        # Gate quality bonus (paid on the *gate pass step* only)
-        "center_at_pass_reward_scale": 15.0,
+        # Gate quality bonus (paid on the gate-pass step only)
+        # Reduced to stop over-centering from dominating faster legal lines.
+        "center_at_pass_reward_scale": 6.0,
 
-        # Speed shaping (project velocity toward current/next gate)
-        "vel_to_gate_reward_scale": 12.0,
-        "vel_to_next_gate_reward_scale": 6.0,
+        # Speed shaping
+        "vel_to_gate_reward_scale": 15.0,
+        "vel_to_next_gate_reward_scale": 10.0,
+        "vel_to_next2_reward_scale": 5.0,
+        "through_gate_speed_reward_scale": 8.0,
 
         # Finish bonus (paid once when lap target is reached)
-        "finish_reward_scale": 600.0,
+        "finish_reward_scale": 900.0,
 
-        # Regularization
-        # NOTE: time_penalty is scaled up by the strategy curriculum in race mode.
-        "time_penalty_reward_scale": -0.03,
-        "action_l2_reward_scale": -0.003,
-        "crash_reward_scale": -4.0,
+        # Regularization / safety
+        # NOTE: time_penalty and death_cost are scaled further by the strategy curriculum.
+        "time_penalty_reward_scale": -0.04,
+        "action_l2_reward_scale": -0.002,
+        "crash_reward_scale": -5.0,
 
         # Terminal penalty on failure terminations (NOT applied on success finish)
-        # NOTE: scaled up by the strategy curriculum in race mode.
-        "death_cost": -120.0,
+        "death_cost": -160.0,
     }
 
     env_cfg.is_train = True
@@ -200,8 +203,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
     # run training
-    # IMPORTANT: disable init_at_random_ep_len for time-to-finish optimization.
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    # IMPORTANT: disable init_at_random_ep_len for clean time-to-finish credit assignment.
+    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
     # close the simulator
     env.close()
 

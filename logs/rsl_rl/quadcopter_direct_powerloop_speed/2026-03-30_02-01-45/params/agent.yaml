@@ -1,0 +1,42 @@
+seed: 42
+device: cuda:0
+num_steps_per_env: 64
+max_iterations: 5000
+empirical_normalization: false
+policy:
+  class_name: ActorCritic
+  init_noise_std: 0.6
+  actor_hidden_dims:
+  - 256
+  - 256
+  - 128
+  critic_hidden_dims:
+  - 512
+  - 256
+  - 128
+  - 128
+  activation: elu
+  min_std: 0.02
+algorithm:
+  class_name: PPO
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  entropy_coef: 0.003
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  learning_rate: 0.0003
+  schedule: adaptive
+  gamma: 0.99
+  lam: 0.95
+  desired_kl: 0.01
+  max_grad_norm: 1.0
+save_interval: 50
+experiment_name: quadcopter_direct_powerloop_speed
+run_name: ''
+logger: wandb
+neptune_project: isaaclab
+wandb_project: ese651_quadcopter
+resume: false
+load_run: .*
+load_checkpoint: model_.*.pt
