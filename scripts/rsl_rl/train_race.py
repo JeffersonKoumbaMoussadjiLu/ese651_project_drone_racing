@@ -17,20 +17,24 @@ if os.path.exists(local_rsl_path):
 else:
     print(f"[WARNING] Local rsl_rl not found at: {local_rsl_path}")
 
-from rsl_rl.utils import wandb_fix
+
+# Patch for wandb/pydantic namespace-package issue in Isaac Sim
+from rsl_rl.utils import wandb_fix  # noqa: F401
+
 import argparse
 from isaaclab.app import AppLauncher
 import cli_args
+
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
-parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+parser.add_argument("--num_envs", type=int, default=8192, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
-parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--max_iterations", type=int, default=10000, help="RL Policy training iterations.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -72,7 +76,8 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 
 # Import extensions to set up environment tasks
-import src.isaac_quad_sim2real.tasks   # noqa: F401
+import src.isaac_quad_sim2real.tasks  # noqa: F401
+
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -83,6 +88,7 @@ torch.backends.cudnn.benchmark = False
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
+
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
@@ -99,24 +105,56 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
+
     # specify directory for logging runs: {time-stamp}_{run_name}
     log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
 
-    # TODO ----- START ----- Define rewards scales
-    # reward scales
-    progress_goal_reward_scale = 50.0
-    crash_reward = -1.0
-    death_cost = -10.0
+    # ------------------------------------------------------------------
+    # Rewards (tune here)
+    #
+    # Key points:
+    #  - Episodes terminate on lap completion during training.
+    #  - Speed is encouraged via velocity-to-gate shaping + time penalty.
+    #  - A finish bonus is larger when finishing earlier.
+    #  - A curriculum inside quadcopter_strategies.py ramps aggressiveness.
+    # ------------------------------------------------------------------
 
     rewards = {
-        'progress_goal_reward_scale': progress_goal_reward_scale,
-        'crash_reward_scale': crash_reward,
-        'death_cost': death_cost,
+        # Dense potential-based shaping (distance-to-current-gate).
+        # Slightly reduced so the policy does not over-prioritize conservative gate-centering.
+        "progress_reward_scale": 16.0,
+
+        # Sparse legality / task events
+        "gate_pass_reward_scale": 75.0,
+        "gate_miss_reward_scale": -250.0,
+        "wrong_way_reward_scale": -250.0,
+        "illegal_gate_reward_scale": -250.0,
+
+        # Gate quality bonus (paid on the gate-pass step only)
+        # Lowered again for the fine-tune so we reward fast exits more than perfect centering.
+        "center_at_pass_reward_scale": 2.5,
+
+        # Speed shaping
+        "vel_to_gate_reward_scale": 16.0,
+        "vel_to_next_gate_reward_scale": 13.0,
+        "vel_to_next2_reward_scale": 7.5,
+        "through_gate_speed_reward_scale": 11.0,
+
+        # Finish bonus (paid once when lap target is reached)
+        "finish_reward_scale": 900.0,
+
+        # Regularization / safety
+        # NOTE: time_penalty and death_cost are scaled further by the strategy curriculum.
+        "time_penalty_reward_scale": -0.055,
+        "action_l2_reward_scale": -0.001,
+        "crash_reward_scale": -5.0,
+
+        # Terminal penalty on failure terminations (NOT applied on success finish)
+        "death_cost": -170.0,
     }
-    # TODO ----- END -----
 
     env_cfg.is_train = True
     env_cfg.rewards = rewards
@@ -149,13 +187,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create runner from rsl-rl
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
+
     # load the checkpoint
     if agent_cfg.resume:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
         runner.load(resume_path)
+        # Fine-tuning usually wants a lower learning rate than the source checkpoint used.
+        # runner.load() restores optimizer state, so we explicitly reset LR here.
+        fine_tune_lr = float(agent_cfg.algorithm.learning_rate)
+        for param_group in runner.alg.optimizer.param_groups:
+            param_group["lr"] = fine_tune_lr
+        print(f"[INFO]: Reset optimizer learning rate for fine-tuning to: {fine_tune_lr}")
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
@@ -164,14 +209,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
     # run training
+    # IMPORTANT: disable init_at_random_ep_len for clean time-to-finish credit assignment.
+    #runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
-
+    
     # close the simulator
     env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
     simulation_app.close()
