@@ -102,30 +102,37 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # ------------------------------------------------------------------
     rewards = {
         # Dense progress (gate-to-gate for most gates, checkpoint-chain for gate 3)
-        "progress_reward_scale": 30.0,
+        "progress_reward_scale": 50.0,
 
         # Sparse events
         "gate_pass_reward_scale": 80.0,
         "gate_miss_reward_scale": -200.0,
 
         # Gate quality
-        "center_at_pass_reward_scale": 15.0,
+        "center_at_pass_reward_scale": 3.0,
 
         # Speed shaping
-        "vel_to_gate_reward_scale": 20.0,
+        "vel_to_gate_reward_scale": 30.0,
         "vel_to_next_gate_reward_scale": 10.0,
-        "speed_bonus_reward_scale": 8.0,
+        "speed_bonus_reward_scale": 15.0,
+        
+        # Inversion reward for powerloop
+        "circle_alignment_reward_scale": 0.5,
+        "flip_alignment_reward_scale": 15.0,
+        "flow_alignment_reward_scale": 20.0,
+        "entry_alignment_reward_scale": 2.0,
+        "exit_alignment_reward_scale": 3.0,
 
         # Finish bonus
         "finish_reward_scale": 1000.0,
 
         # Regularization
-        "time_penalty_reward_scale": -0.05,
+        "time_penalty_reward_scale": -0.1,
         "action_l2_reward_scale": -0.002,
         "crash_reward_scale": -4.0,
 
         # Terminal penalty
-        "death_cost": -120.0,
+        "death_cost": -300.0,
     }
     # TODO ----- END -----
 

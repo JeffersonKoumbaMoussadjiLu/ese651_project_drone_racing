@@ -37,6 +37,9 @@ class DefaultQuadcopterStrategy:
         # Previous actions stored for observation smoothing
         self._prev_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
 
+        # Previous speeds for reward shaping
+        self._prev_speed = torch.zeros(self.num_envs, device=self.device)
+
         # Create _finished flag if the env doesn't have it (compatibility with original env)
         if not hasattr(self.env, '_finished'):
             self.env._finished = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
@@ -85,10 +88,13 @@ class DefaultQuadcopterStrategy:
         ], device=self.device)
         self._num_checkpoints = self._powerloop_checkpoints.shape[0]
         self._checkpoint_radius = 0.7  # larger tolerance for path variation under DR
+        self._loop_center = torch.tensor([0.0, 0.0, 1.5], device=self.device)
+        self._loop_radius = 0.5
 
         # Per-env tracking: which checkpoint each env is targeting
         self._checkpoint_idx = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self._prev_dist_to_checkpoint = torch.full((self.num_envs,), 5.0, device=self.device)
+        self._prev_angle = torch.full((self.num_envs,), 0.0, device=self.device)
         # Altitude validator: track max altitude while targeting gate 3
         self._max_z_during_gate3 = torch.zeros(self.num_envs, device=self.device)
 
@@ -108,11 +114,12 @@ class DefaultQuadcopterStrategy:
     # ------------------------------------------------------------------
     def _get_dr_strength(self) -> float:
         """Get current DR strength in [0, 1]. Ramps linearly over first 1500 iterations."""
-        it = int(getattr(self.env, "iteration", 0))
-        dr_ramp_end = 1500
-        if dr_ramp_end <= 0:
-            return 1.0
-        return float(np.clip(it / float(dr_ramp_end), 0.0, 1.0))
+        # it = int(getattr(self.env, "iteration", 0))
+        # dr_ramp_end = 1500
+        # if dr_ramp_end <= 0:
+        #     return 1.0
+        # return float(np.clip(it / float(dr_ramp_end), 0.0, 1.0))
+        return 0.0
 
     def _randomize_physics(self, env_ids: torch.Tensor):
         """Randomize physics for reset environments to match TA evaluation ranges."""
@@ -187,6 +194,10 @@ class DefaultQuadcopterStrategy:
 
         # Get drone state
         drone_pos_w = self.env._robot.data.root_link_pos_w
+        drone_quat_w = self.env._robot.data.root_quat_w
+        drone_lin_vel_b = self.env._robot.data.root_com_lin_vel_b
+        _, pitch, _ = euler_xyz_from_quat(drone_quat_w)
+        pitch = wrap_to_pi(pitch)
         idx = self.env._idx_wp
 
         # Drone position in current gate frame
@@ -231,6 +242,30 @@ class DefaultQuadcopterStrategy:
             self._prev_dist_to_checkpoint = torch.where(
                 is_gate3, dist_to_cp, self._prev_dist_to_checkpoint)
 
+            loop_error = drone_pos_w - self._loop_center
+            radius = torch.linalg.norm(loop_error, dim=1)
+            circle_reward = torch.exp(-(radius - self._loop_radius) ** 2 / 0.5)
+
+            # angle = torch.atan2(-loop_error[:, 1], loop_error[:, 2])
+            # angle_delta = wrap_to_pi(angle - self._prev_angle)
+            # self._prev_angle = torch.where(is_gate3, angle, self._prev_angle)
+            # angle_progress = torch.clamp(angle_delta, -0.5, 0.5)
+
+            at_top = drone_pos_w[:,2] > self._loop_center[2] + self._loop_radius * 0.75
+            flip_alignment = torch.cos(pitch)
+            flip_reward = at_top * torch.clamp(-flip_alignment, -1.0, 1.0)
+
+            tangent = torch.stack([-loop_error[:, 2], loop_error[:, 0], torch.zeros_like(loop_error[:, 0])], dim=1)
+            tangent = tangent / (torch.linalg.norm(tangent, dim=1, keepdim=True) + 1e-6)
+
+            tangent_vel = torch.sum(drone_lin_vel_b * tangent, dim=1)
+
+            flow_reward = torch.clamp(tangent_vel, 0.0, self._v_cap)
+
+            is_below = is_gate3 & (drone_pos_w[:, 2] < self._loop_center[2] - self._loop_radius * 0.5)
+            entry_reward = (is_below & cp_idx == 0) * torch.clamp(pitch, 0.0, 1.0)
+            exit_reward = (is_below & cp_idx == self._num_checkpoints - 1) * torch.exp(-pitch**2)
+
             # Update altitude tracker
             self._max_z_during_gate3 = torch.where(
                 is_gate3,
@@ -239,8 +274,15 @@ class DefaultQuadcopterStrategy:
 
             # REPLACE progress for gate 3 envs with checkpoint progress
             progress = torch.where(is_gate3, cp_progress, standard_progress)
+            circle_reward = is_gate3 * circle_reward
+            flip_reward = is_gate3 * flip_reward
         else:
             progress = standard_progress
+            circle_reward = torch.zeros_like(standard_progress)
+            flip_reward = torch.zeros_like(standard_progress)
+            flow_reward = torch.zeros_like(standard_progress)
+            entry_reward = torch.zeros_like(standard_progress)
+            exit_reward = torch.zeros_like(standard_progress)
 
         # Gate pass detection
         prev_xg = self.env._prev_x_drone_wrt_gate
@@ -274,9 +316,6 @@ class DefaultQuadcopterStrategy:
         action_l2 = torch.sum(self.env._actions ** 2, dim=1)
 
         # Velocity shaping
-        drone_quat_w = self.env._robot.data.root_quat_w
-        drone_lin_vel_b = self.env._robot.data.root_com_lin_vel_b
-
         gate_pos_w = self.env._waypoints[idx, :3]
         next_idx = (idx + 1) % self.env._waypoints.shape[0]
         next_gate_pos_w = self.env._waypoints[next_idx, :3]
@@ -373,17 +412,22 @@ class DefaultQuadcopterStrategy:
         if self.cfg.is_train:
             # TODO ----- START ----- Compute per-timestep rewards
             rewards = {
-                "progress":         progress * self.env.rew["progress_reward_scale"],
-                "gate_pass":        gate_pass.float() * self.env.rew["gate_pass_reward_scale"],
-                "gate_miss":        gate_miss.float() * self.env.rew["gate_miss_reward_scale"],
-                "center_at_pass":   center_at_pass * (self.env.rew["center_at_pass_reward_scale"] * center_mult),
-                "vel_to_gate":      vel_to_gate * (self.env.rew["vel_to_gate_reward_scale"] * vel_mult),
-                "vel_to_next_gate": vel_to_next_gate * (self.env.rew["vel_to_next_gate_reward_scale"] * vel_mult),
-                "speed_bonus":      speed_bonus * (self.env.rew["speed_bonus_reward_scale"] * vel_mult),
-                "finish":           finished_this_step.float() * self.env.rew["finish_reward_scale"] * finish_bonus_scale,
-                "time_penalty":     torch.ones_like(dist) * (self.env.rew["time_penalty_reward_scale"] * time_mult),
-                "action_l2":        action_l2 * (self.env.rew["action_l2_reward_scale"] * action_mult),
-                "crash":            crashed * self.env.rew["crash_reward_scale"],
+                "progress":             progress * self.env.rew["progress_reward_scale"],
+                "gate_pass":            gate_pass.float() * self.env.rew["gate_pass_reward_scale"],
+                "gate_miss":            gate_miss.float() * self.env.rew["gate_miss_reward_scale"],
+                "center_at_pass":       center_at_pass * (self.env.rew["center_at_pass_reward_scale"] * center_mult),
+                "vel_to_gate":          vel_to_gate * (self.env.rew["vel_to_gate_reward_scale"] * vel_mult),
+                "vel_to_next_gate":     vel_to_next_gate * (self.env.rew["vel_to_next_gate_reward_scale"] * vel_mult),
+                "speed_bonus":          speed_bonus * (self.env.rew["speed_bonus_reward_scale"] * vel_mult),
+                "circle_alignment":     circle_reward * self.env.rew["circle_alignment_reward_scale"],
+                "flip_alignment":       flip_reward * self.env.rew["flip_alignment_reward_scale"],
+                "flow_alignment":       flow_reward * (self.env.rew["flow_alignment_reward_scale"] * vel_mult),
+                "entry_alignment":      entry_reward * self.env.rew["entry_alignment_reward_scale"],
+                "exit_alignment":       exit_reward * self.env.rew["exit_alignment_reward_scale"],
+                "finish":               finished_this_step.float() * self.env.rew["finish_reward_scale"] * finish_bonus_scale,
+                "time_penalty":         torch.ones_like(dist) * (self.env.rew["time_penalty_reward_scale"] * time_mult),
+                "action_l2":            action_l2 * (self.env.rew["action_l2_reward_scale"] * action_mult),
+                "crash":                crashed * self.env.rew["crash_reward_scale"],
             }
             reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
 
@@ -624,6 +668,6 @@ class DefaultQuadcopterStrategy:
         self.env._last_distance_to_goal[env_ids] = torch.linalg.norm(
             self.env._pose_drone_wrt_gate[env_ids], dim=1)
 
-        # Domain randomization
-        if self.cfg.is_train:
-            self._randomize_physics(env_ids)
+        # # Domain randomization
+        # if self.cfg.is_train:
+        #     self._randomize_physics(env_ids)
