@@ -123,37 +123,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # ------------------------------------------------------------------
 
     rewards = {
-        # Dense potential-based shaping (distance-to-current-gate).
-        # Slightly reduced so the policy does not over-prioritize conservative gate-centering.
-        "progress_reward_scale": 16.0,
-
         # Sparse legality / task events
-        "gate_pass_reward_scale": 75.0,
+        "gate_pass_reward_scale": 300.0,
         "gate_miss_reward_scale": -250.0,
         "wrong_way_reward_scale": -250.0,
         "illegal_gate_reward_scale": -250.0,
-
-        # Gate quality bonus (paid on the gate-pass step only)
-        # Lowered again for the fine-tune so we reward fast exits more than perfect centering.
-        "center_at_pass_reward_scale": 2.5,
-
-        # Speed shaping
-        "vel_to_gate_reward_scale": 16.0,
-        "vel_to_next_gate_reward_scale": 13.0,
-        "vel_to_next2_reward_scale": 7.5,
-        "through_gate_speed_reward_scale": 11.0,
 
         # Finish bonus (paid once when lap target is reached)
         "finish_reward_scale": 900.0,
 
         # Regularization / safety
         # NOTE: time_penalty and death_cost are scaled further by the strategy curriculum.
-        "time_penalty_reward_scale": -0.055,
+        "time_penalty_reward_scale": -0.07,
         "action_l2_reward_scale": -0.001,
         "crash_reward_scale": -5.0,
 
         # Terminal penalty on failure terminations (NOT applied on success finish)
-        "death_cost": -170.0,
+        "death_cost": -200.0,
     }
 
     env_cfg.is_train = True

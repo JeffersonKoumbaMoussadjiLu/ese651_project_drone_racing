@@ -320,6 +320,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._tau_m = torch.zeros(self.num_envs, 4, device=self.device)
         self._omega_err_integral = torch.zeros(self.num_envs, 3, device=self.device)
         self._thrust_to_weight = torch.zeros(self.num_envs, device=self.device)
+        self._k_eta = torch.zeros(self.num_envs, device=self.device)
 
         # Store fixed parameter values
         self._twr_value = self.cfg.thrust_to_weight
@@ -332,6 +333,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._ki_omega_y_value = self.cfg.ki_omega_y
         self._kd_omega_y_value = self.cfg.kd_omega_y
         self._tau_m_value = self.cfg.tau_m
+        self._k_eta_value = self.cfg.k_eta
 
         # Initialize the strategy for rewards, observations, and resets
         # Strategy __init__ may set fixed parameter values using the _value attributes above
@@ -429,7 +431,13 @@ class QuadcopterEnv(DirectRLEnv):
                 [ 1.5, 7.00, 0.75, 0.0, 0.0,  1.57],
                 [ 0.0, 5.25, 1.50, 0.0, 0.0,  0.00],
                 [-2.0, 3.50, 0.75, 0.0, 0.0,  1.57],
-            ]
+            ],
+            'circle': [
+                [ 0.0 , 3.0, 0.75, 0.0, 0.0,  0.00],
+                [-1.5 , 4.5, 0.75, 0.0, 0.0, -1.57],
+                [ 0.0 , 6.0, 1.75, 0.0, 0.0,  3.14],
+                [ 1.5 , 4.5, 0.75, 0.0, 0.0,  1.57],
+            ],
         }
 
         self._waypoints = torch.tensor(tracks[self.cfg.track_name], device=self.device)
