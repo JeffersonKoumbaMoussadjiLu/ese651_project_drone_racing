@@ -24,7 +24,7 @@ class ActorCriticRecurrent(ActorCritic):
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
         rnn_type="lstm",
-        rnn_hidden_size=256,
+        rnn_hidden_size=128,
         rnn_num_layers=1,
         init_noise_std=1.0,
         **kwargs,
